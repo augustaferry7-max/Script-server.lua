@@ -1,189 +1,96 @@
--- Server-authoritative training example for a Roblox experience you own.
--- Place in ServerScriptService. Never trust client-supplied stat values or multipliers.
+-- Place in ServerScriptService.
+-- Server-authoritative training for your own Roblox experience.
+-- Clients can request a session, but the server controls timing and awards.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local MarketplaceService = game:GetService("MarketplaceService")
 
-local TRAIN_INTERVAL = 1
-local BASE_GAIN_PER_TICK = 1
+local REMOTE_NAME = "TrainingToggle"
+local STAT_NAME = "TrainingPower"
+local BASE_RATE = 1 -- XP awarded per second at the normal rate
+local TRAINING_MULTIPLIER = 9
+local TICK_SECONDS = 1
+local MAX_SESSION_SECONDS = 60 * 60 -- safely stop stale sessions after one hour
 
--- Set this to your 3x-training game pass ID. Keep it at 0 until configured.
--- Optional developer/test access is controlled by this server-only list.
-local THREE_X_GAMEPASS_ID = 0
-local THREE_X_ALLOWED_USER_IDS = {
-	-- [123456789] = true,
-}
-
-local REMOTE_FOLDER_NAME = "HakiTrainingRemotes"
-local REQUEST_FUNCTION_NAME = "RequestTrainingState"
-
-local remoteFolder = ReplicatedStorage:FindFirstChild(REMOTE_FOLDER_NAME)
-if not remoteFolder then
-	remoteFolder = Instance.new("Folder")
-	remoteFolder.Name = REMOTE_FOLDER_NAME
-	remoteFolder.Parent = ReplicatedStorage
+local toggleRemote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not toggleRemote then
+    toggleRemote = Instance.new("RemoteEvent")
+    toggleRemote.Name = REMOTE_NAME
+    toggleRemote.Parent = ReplicatedStorage
 end
 
-local requestFunction = remoteFolder:FindFirstChild(REQUEST_FUNCTION_NAME)
-if requestFunction and not requestFunction:IsA("RemoteFunction") then
-	error(REQUEST_FUNCTION_NAME .. " must be a RemoteFunction")
-end
-if not requestFunction then
-	requestFunction = Instance.new("RemoteFunction")
-	requestFunction.Name = REQUEST_FUNCTION_NAME
-	requestFunction.Parent = remoteFolder
-end
+local active = {}
 
-local playerStates = {}
-local lastRequestAt = {}
-local REQUEST_COOLDOWN = 0.12
-
-local function hasTripleAccess(player)
-	if THREE_X_ALLOWED_USER_IDS[player.UserId] == true then
-		return true
-	end
-
-	if THREE_X_GAMEPASS_ID <= 0 then
-		return false
-	end
-
-	local ok, ownsPass = pcall(
-		MarketplaceService.UserOwnsGamePassAsync,
-		MarketplaceService,
-		player.UserId,
-		THREE_X_GAMEPASS_ID
-	)
-	return ok and ownsPass == true
+local function getTrainingStat(player)
+    local leaderstats = player:FindFirstChild("leaderstats")
+    local stat = leaderstats and leaderstats:FindFirstChild(STAT_NAME)
+    if stat and (stat:IsA("IntValue") or stat:IsA("NumberValue")) then
+        return stat
+    end
+    return nil
 end
 
-local function getOrCreateHakiStat(player)
-	local leaderstats = player:FindFirstChild("leaderstats")
-	if not leaderstats then
-		leaderstats = Instance.new("Folder")
-		leaderstats.Name = "leaderstats"
-		leaderstats.Parent = player
-	end
-
-	local haki = leaderstats:FindFirstChild("Haki")
-	if haki then
-		if haki:IsA("IntValue") or haki:IsA("NumberValue") then
-			return haki
-		end
-		warn(("Haki must be an IntValue or NumberValue for %s"):format(player.Name))
-		return nil
-	end
-
-	haki = Instance.new("IntValue")
-	haki.Name = "Haki"
-	haki.Value = 0
-	haki.Parent = leaderstats
-	return haki
+local function setSession(player, enabled)
+    if enabled then
+        if not getTrainingStat(player) then
+            toggleRemote:FireClient(player, false, "TrainingPower stat not found")
+            return
+        end
+        active[player] = os.clock()
+        toggleRemote:FireClient(player, true)
+    else
+        active[player] = nil
+        toggleRemote:FireClient(player, false)
+    end
 end
 
-local function getStateSnapshot(player)
-	local state = playerStates[player]
-	if not state then
-		return nil
-	end
+toggleRemote.OnServerEvent:Connect(function(player, requestedState)
+    if typeof(requestedState) ~= "boolean" then
+        return
+    end
+    setSession(player, requestedState)
+end)
 
-	return {
-		autoTraining = state.autoTraining,
-		tripleTraining = state.tripleTraining,
-		canUseTriple = state.canUseTriple,
-	}
-end
+task.spawn(function()
+    while true do
+        task.wait(TICK_SECONDS)
+        local now = os.clock()
+        for player, startedAt in pairs(active) do
+            if player.Parent ~= Players or now - startedAt >= MAX_SESSION_SECONDS then
+                active[player] = nil
+                if player.Parent == Players then
+                    toggleRemote:FireClient(player, false, "Training session ended")
+                end
+            else
+                local stat = getTrainingStat(player)
+                if stat then
+                    stat.Value += BASE_RATE * TRAINING_MULTIPLIER * TICK_SECONDS
+                else
+                    active[player] = nil
+                    toggleRemote:FireClient(player, false, "TrainingPower stat not found")
+                end
+            end
+        end
+    end
+end)
 
-local function addTraining(player, state)
-	if not state.autoTraining then
-		return
-	end
+Players.PlayerRemoving:Connect(function(player)
+    active[player] = nil
+end)
 
-	local haki = getOrCreateHakiStat(player)
-	if not haki then
-		return
-	end
+-- Minimal example stat. Remove this block if your game already creates TrainingPower.
+Players.PlayerAdded:Connect(function(player)
+    local leaderstats = player:FindFirstChild("leaderstats")
+    if not leaderstats then
+        leaderstats = Instance.new("Folder")
+        leaderstats.Name = "leaderstats"
+        leaderstats.Parent = player
+    end
 
-	local multiplier = state.tripleTraining and state.canUseTriple and 3 or 1
-	-- The server chooses the gain. The client cannot submit an amount.
-	haki.Value += BASE_GAIN_PER_TICK * multiplier
-end
-
-local function onPlayerAdded(player)
-	local state = {
-		autoTraining = false,
-		tripleTraining = false,
-		canUseTriple = THREE_X_ALLOWED_USER_IDS[player.UserId] == true,
-	}
-	playerStates[player] = state
-	getOrCreateHakiStat(player)
-
-	if not state.canUseTriple and THREE_X_GAMEPASS_ID > 0 then
-		task.spawn(function()
-			state.canUseTriple = hasTripleAccess(player)
-			if not state.canUseTriple then
-				state.tripleTraining = false
-			end
-		end)
-	end
-
-	task.spawn(function()
-		while player.Parent == Players do
-			task.wait(TRAIN_INTERVAL)
-			if player.Parent == Players and playerStates[player] == state then
-				addTraining(player, state)
-			end
-		end
-	end)
-end
-
-local function onPlayerRemoving(player)
-	playerStates[player] = nil
-	lastRequestAt[player] = nil
-end
-
-requestFunction.OnServerInvoke = function(player, action, requestedValue)
-	if typeof(action) ~= "string" then
-		return nil
-	end
-
-	local now = os.clock()
-	local lastAt = lastRequestAt[player] or 0
-	if now - lastAt < REQUEST_COOLDOWN then
-		return getStateSnapshot(player)
-	end
-	lastRequestAt[player] = now
-
-	local state = playerStates[player]
-	if not state then
-		return nil
-	end
-
-	if action == "get" then
-		return getStateSnapshot(player)
-	end
-
-	if typeof(requestedValue) ~= "boolean" then
-		return getStateSnapshot(player)
-	end
-
-	if action == "setAuto" then
-		state.autoTraining = requestedValue
-	elseif action == "setTriple" then
-		-- Entitlement is checked on the server; a modified client cannot bypass it.
-		if state.canUseTriple then
-			state.tripleTraining = requestedValue
-		else
-			state.tripleTraining = false
-		end
-	end
-
-	return getStateSnapshot(player)
-end
-
-Players.PlayerAdded:Connect(onPlayerAdded)
-Players.PlayerRemoving:Connect(onPlayerRemoving)
-
-for _, player in Players:GetPlayers() do
-	task.spawn(onPlayerAdded, player)
-end
+    if not leaderstats:FindFirstChild(STAT_NAME) then
+        local power = Instance.new("IntValue")
+        power.Name = STAT_NAME
+        power.Value = 0
+        power.Parent = leaderstats
+    end
+end)
